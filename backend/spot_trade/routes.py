@@ -1,6 +1,7 @@
 """Spot trading API routes"""
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+import io
 from typing import Optional
 import sys
 from pathlib import Path
@@ -31,7 +32,13 @@ from spot_trade.schemas import (
     TradeHistoryResponse,
     OpenOrdersResponse
 )
-from spot_trade.models import get_user_trades, get_open_orders, get_all_trades
+from spot_trade.models import (
+    get_user_trades,
+    get_open_orders,
+    get_all_trades,
+    mark_trade_admin_seen,
+    get_admin_income_summary,
+)
 
 router = APIRouter()
 stripe.api_key = settings.stripe_secret_key
@@ -442,15 +449,60 @@ async def approve_or_reject_withdrawal(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to process withdrawal decision: {str(e)}")
 
 
-@router.get("/admin/spot-trades", response_model=TradeHistoryResponse)
+@router.get("/admin/spot-trades")
 async def get_spot_trades_for_admin(
     limit: int = 200,
     offset: int = 0,
     _admin: dict = Depends(require_admin)
 ):
-    """Admin listing of all BUY/SELL spot trades"""
+    """Super-admin listing of all BUY/SELL spot trades with review (seen) status."""
+    from .schemas import AdminSpotTradeItem, AdminSpotTradeListResponse
+
     trades = get_all_trades(limit=limit, offset=offset)
-    from .schemas import TradeHistoryItem
-    items = [TradeHistoryItem(**trade) for trade in trades]
-    return TradeHistoryResponse(trades=items, total=len(items), limit=limit, offset=offset)
+    items = [AdminSpotTradeItem(**trade) for trade in trades]
+    return AdminSpotTradeListResponse(trades=items, total=len(items), limit=limit, offset=offset)
+
+
+@router.post("/admin/spot-trades/{trade_id}/seen")
+async def mark_spot_trade_seen(
+    trade_id: int,
+    admin: dict = Depends(require_admin),
+):
+    """Mark a gold buy/sell trade as seen by the current super admin."""
+    from .schemas import AdminSpotTradeItem
+
+    trade = mark_trade_admin_seen(trade_id, admin["user_id"])
+    if not trade:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trade not found")
+    return AdminSpotTradeItem(**trade)
+
+
+@router.get("/admin/income/summary")
+async def get_income_summary_for_admin(_admin: dict = Depends(require_admin)):
+    """Platform revenue (fees) summary for the super-admin dashboard."""
+    from .schemas import AdminIncomeSummary
+
+    summary = get_admin_income_summary()
+    return AdminIncomeSummary(**summary)
+
+
+@router.get("/admin/backup")
+async def download_admin_backup(admin: dict = Depends(require_admin)):
+    """Full spot-trading database export (ZIP + manifest) for super admins."""
+    from datetime import datetime, timezone
+    from .backup import build_spot_backup_zip
+
+    exported_by = str(admin.get("user_id", "super_admin"))
+    zip_bytes = build_spot_backup_zip(exported_by=exported_by)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"kgf-spot-trading-backup_{stamp}.zip"
+
+    return StreamingResponse(
+        io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 

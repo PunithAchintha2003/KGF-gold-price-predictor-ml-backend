@@ -99,6 +99,37 @@ class TradeHistoryResponse(BaseModel):
     offset: int
 
 
+class AdminSpotTradeItem(TradeHistoryItem):
+    """Super-admin spot trade row with review status (not exposed to customers)."""
+    admin_seen: bool = False
+    admin_seen_at: Optional[str] = None
+    admin_seen_by: Optional[str] = None
+
+
+class AdminSpotTradeListResponse(BaseModel):
+    trades: list[AdminSpotTradeItem]
+    total: int
+    limit: int
+    offset: int
+
+
+class RevenueBreakdown(BaseModel):
+    total: float
+    today: float
+    this_month: float
+
+
+class AdminIncomeSummary(BaseModel):
+    """Platform revenue (fees) earned by the operator, for the super-admin dashboard."""
+    currency: str = "LKR"
+    total: float
+    today: float
+    this_month: float
+    trade_fees: RevenueBreakdown
+    wallet_fees: RevenueBreakdown
+    last_revenue_at: Optional[str] = None
+
+
 class OpenOrderItem(BaseModel):
     """Schema for individual open order"""
     id: int
