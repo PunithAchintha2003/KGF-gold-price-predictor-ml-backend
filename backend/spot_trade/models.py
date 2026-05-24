@@ -75,6 +75,9 @@ def init_spot_trade_tables():
                     total_value DECIMAL(20, 2) NOT NULL CHECK (total_value > 0),
                     fee DECIMAL(20, 2) DEFAULT 0.0,
                     status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'CANCELLED')),
+                    admin_seen BOOLEAN NOT NULL DEFAULT FALSE,
+                    admin_seen_at TIMESTAMP,
+                    admin_seen_by VARCHAR(255),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES user_balances(user_id) ON DELETE CASCADE
@@ -104,6 +107,17 @@ def init_spot_trade_tables():
                 # Column already exists or other error - continue
                 conn.rollback()
                 pass
+
+            for migration_sql in (
+                "ALTER TABLE spot_trades ADD COLUMN admin_seen BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE spot_trades ADD COLUMN admin_seen_at TIMESTAMP",
+                "ALTER TABLE spot_trades ADD COLUMN admin_seen_by VARCHAR(255)",
+            ):
+                try:
+                    cursor.execute(migration_sql)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS wallet_transactions (
@@ -153,6 +167,9 @@ def init_spot_trade_tables():
                     total_value REAL NOT NULL CHECK (total_value > 0),
                     fee REAL DEFAULT 0.0,
                     status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'CANCELLED')),
+                    admin_seen INTEGER NOT NULL DEFAULT 0,
+                    admin_seen_at TIMESTAMP,
+                    admin_seen_by TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES user_balances(user_id) ON DELETE CASCADE
@@ -182,6 +199,17 @@ def init_spot_trade_tables():
                 # Column already exists or other error - continue
                 conn.rollback()
                 pass
+
+            for migration_sql in (
+                "ALTER TABLE spot_trades ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE spot_trades ADD COLUMN admin_seen_at TIMESTAMP",
+                "ALTER TABLE spot_trades ADD COLUMN admin_seen_by TEXT",
+            ):
+                try:
+                    cursor.execute(migration_sql)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS wallet_transactions (
@@ -496,15 +524,59 @@ def get_open_orders(user_id: str) -> list:
         return orders
 
 
-def get_all_trades(limit: int = 200, offset: int = 0) -> list:
-    """Get all spot trades for admin"""
+def _parse_admin_seen(value) -> bool:
+    """Coerce admin_seen column values from any supported backend to a Python bool."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y"}
+    return bool(value)
+
+
+def _format_trade_row_for_admin(row) -> dict:
+    """Map admin spot_trades SELECT row to API dict (quantities in pawn).
+
+    Expected SELECT column order:
+        0:id, 1:user_id, 2:order_type, 3:quantity, 4:price, 5:total_value,
+        6:fee, 7:status, 8:created_at, 9:updated_at,
+        10:admin_seen, 11:admin_seen_at, 12:admin_seen_by
+    """
     TROY_OUNCE_TO_PAWN = 31.1035 / 8.0
+    admin_seen_at = row[11]
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "order_type": row[2],
+        "quantity": float(row[3]) * TROY_OUNCE_TO_PAWN,
+        "price": float(row[4]),
+        "total_value": float(row[5]),
+        "fee": float(row[6]) if row[6] is not None else 0.0,
+        "status": row[7],
+        "created_at": row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+        "updated_at": row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+        "admin_seen": _parse_admin_seen(row[10]),
+        "admin_seen_at": (
+            admin_seen_at.isoformat()
+            if admin_seen_at is not None and hasattr(admin_seen_at, "isoformat")
+            else (str(admin_seen_at) if admin_seen_at is not None else None)
+        ),
+        "admin_seen_by": row[12],
+    }
+
+
+def get_all_trades(limit: int = 200, offset: int = 0) -> list:
+    """Get all spot trades for super-admin review (includes seen status)."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         db_type = get_db_type()
         if db_type == "postgresql":
             cursor.execute(
-                """SELECT id, user_id, order_type, quantity, price, total_value, fee, status, created_at, updated_at
+                """SELECT id, user_id, order_type, quantity, price, total_value, fee, status,
+                          created_at, updated_at, admin_seen, admin_seen_at, admin_seen_by
                    FROM spot_trades
                    ORDER BY created_at DESC
                    LIMIT %s OFFSET %s""",
@@ -512,28 +584,167 @@ def get_all_trades(limit: int = 200, offset: int = 0) -> list:
             )
         else:
             cursor.execute(
-                """SELECT id, user_id, order_type, quantity, price, total_value, fee, status, created_at, updated_at
+                """SELECT id, user_id, order_type, quantity, price, total_value, fee, status,
+                          created_at, updated_at, admin_seen, admin_seen_at, admin_seen_by
                    FROM spot_trades
                    ORDER BY created_at DESC
                    LIMIT ? OFFSET ?""",
                 (limit, offset),
             )
         rows = cursor.fetchall()
-        result = []
-        for row in rows:
-            result.append({
-                "id": row[0],
-                "user_id": row[1],
-                "order_type": row[2],
-                "quantity": float(row[3]) * TROY_OUNCE_TO_PAWN,
-                "price": float(row[4]),
-                "total_value": float(row[5]),
-                "fee": float(row[6]) if row[6] is not None else 0.0,
-                "status": row[7],
-                "created_at": row[8].isoformat() if hasattr(row[8], 'isoformat') else str(row[8]),
-                "updated_at": row[9].isoformat() if hasattr(row[9], 'isoformat') else str(row[9]),
-            })
-        return result
+        return [_format_trade_row_for_admin(row) for row in rows]
+
+
+def get_admin_income_summary() -> dict:
+    """Aggregate platform revenue (fees) from completed trades and wallet transactions.
+
+    Returns totals in LKR for: all-time, today, and current month. Also returns
+    a breakdown by source (spot_trades vs wallet_transactions) and the most
+    recent revenue timestamp.
+
+    Only revenue-earning rows are counted:
+      - spot_trades.status = 'COMPLETED'
+      - wallet_transactions.status IN ('COMPLETED', 'APPROVED')
+    """
+    db_type = get_db_type()
+
+    if db_type == "postgresql":
+        today_predicate = "created_at >= DATE_TRUNC('day', CURRENT_TIMESTAMP)"
+        month_predicate = "created_at >= DATE_TRUNC('month', CURRENT_TIMESTAMP)"
+    else:
+        today_predicate = "date(created_at) = date('now')"
+        month_predicate = "strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')"
+
+    def _scalar(cursor) -> float:
+        row = cursor.fetchone()
+        if not row or row[0] is None:
+            return 0.0
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return 0.0
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Spot trade fees (BUY/SELL revenue)
+        cursor.execute(
+            "SELECT COALESCE(SUM(fee), 0) FROM spot_trades WHERE status = 'COMPLETED'"
+        )
+        trade_total = _scalar(cursor)
+
+        cursor.execute(
+            f"SELECT COALESCE(SUM(fee), 0) FROM spot_trades "
+            f"WHERE status = 'COMPLETED' AND {today_predicate}"
+        )
+        trade_today = _scalar(cursor)
+
+        cursor.execute(
+            f"SELECT COALESCE(SUM(fee), 0) FROM spot_trades "
+            f"WHERE status = 'COMPLETED' AND {month_predicate}"
+        )
+        trade_month = _scalar(cursor)
+
+        # Wallet transaction fees (deposit/withdraw revenue)
+        cursor.execute(
+            "SELECT COALESCE(SUM(fee), 0) FROM wallet_transactions "
+            "WHERE status IN ('COMPLETED', 'APPROVED')"
+        )
+        wallet_total = _scalar(cursor)
+
+        cursor.execute(
+            f"SELECT COALESCE(SUM(fee), 0) FROM wallet_transactions "
+            f"WHERE status IN ('COMPLETED', 'APPROVED') AND {today_predicate}"
+        )
+        wallet_today = _scalar(cursor)
+
+        cursor.execute(
+            f"SELECT COALESCE(SUM(fee), 0) FROM wallet_transactions "
+            f"WHERE status IN ('COMPLETED', 'APPROVED') AND {month_predicate}"
+        )
+        wallet_month = _scalar(cursor)
+
+        # Most recent revenue timestamp (whichever of the two tables is fresher)
+        cursor.execute(
+            """
+            SELECT MAX(ts) FROM (
+                SELECT MAX(created_at) AS ts FROM spot_trades WHERE status = 'COMPLETED'
+                UNION ALL
+                SELECT MAX(created_at) AS ts FROM wallet_transactions
+                WHERE status IN ('COMPLETED', 'APPROVED')
+            ) AS latest
+            """
+        )
+        latest_row = cursor.fetchone()
+        latest_ts = latest_row[0] if latest_row else None
+        last_revenue_at = (
+            latest_ts.isoformat()
+            if latest_ts is not None and hasattr(latest_ts, "isoformat")
+            else (str(latest_ts) if latest_ts is not None else None)
+        )
+
+    return {
+        "currency": "LKR",
+        "total": round(trade_total + wallet_total, 2),
+        "today": round(trade_today + wallet_today, 2),
+        "this_month": round(trade_month + wallet_month, 2),
+        "trade_fees": {
+            "total": round(trade_total, 2),
+            "today": round(trade_today, 2),
+            "this_month": round(trade_month, 2),
+        },
+        "wallet_fees": {
+            "total": round(wallet_total, 2),
+            "today": round(wallet_today, 2),
+            "this_month": round(wallet_month, 2),
+        },
+        "last_revenue_at": last_revenue_at,
+    }
+
+
+def mark_trade_admin_seen(trade_id: int, admin_user_id: str) -> Optional[dict]:
+    """Mark a spot trade as reviewed by super admin."""
+    now = datetime.utcnow()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        db_type = get_db_type()
+        if db_type == "postgresql":
+            cursor.execute(
+                """UPDATE spot_trades
+                   SET admin_seen = TRUE, admin_seen_at = %s, admin_seen_by = %s, updated_at = %s
+                   WHERE id = %s""",
+                (now, admin_user_id, now, trade_id),
+            )
+        else:
+            cursor.execute(
+                """UPDATE spot_trades
+                   SET admin_seen = 1, admin_seen_at = ?, admin_seen_by = ?, updated_at = ?
+                   WHERE id = ?""",
+                (now, admin_user_id, now, trade_id),
+            )
+        if cursor.rowcount == 0:
+            return None
+
+        conn.commit()
+
+        if db_type == "postgresql":
+            cursor.execute(
+                """SELECT id, user_id, order_type, quantity, price, total_value, fee, status,
+                          created_at, updated_at, admin_seen, admin_seen_at, admin_seen_by
+                   FROM spot_trades WHERE id = %s""",
+                (trade_id,),
+            )
+        else:
+            cursor.execute(
+                """SELECT id, user_id, order_type, quantity, price, total_value, fee, status,
+                          created_at, updated_at, admin_seen, admin_seen_at, admin_seen_by
+                   FROM spot_trades WHERE id = ?""",
+                (trade_id,),
+            )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return _format_trade_row_for_admin(row)
 
 
 def create_wallet_transaction(
